@@ -1,8 +1,8 @@
-from langchain.document_loaders import PyPDFLoader, DirectoryLoader
+from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List
 from langchain.schema import Document
-from langchain.embeddings import HuggingFaceEmbeddings
 import torch
 from langchain_groq import ChatGroq
 from langchain.chains import create_retrieval_chain

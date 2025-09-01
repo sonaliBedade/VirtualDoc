@@ -20,4 +20,7 @@ langchain-groq
 # Interface
 flask
 
+# Eval
+Ragas
+
 -e .
