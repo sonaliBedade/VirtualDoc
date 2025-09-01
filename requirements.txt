@@ -15,7 +15,7 @@ python-dotenv
 langchain-pinecone
 
 # LLM 
-langchain-openai
+langchain-groq
 
 # Interface
 flask
