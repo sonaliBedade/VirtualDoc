@@ -1,4 +1,4 @@
-name: CI & Deploy
+name: CI & Deploy (GH-hosted + SSM)
 
 on:
   push:
@@ -24,9 +24,10 @@ jobs:
             ! grep -qi '^pinecone-plugin-' requirements.txt || (echo "Remove pinecone plugins"; exit 1)
           fi
 
-  Continuous-Deployment:
+  # If you already build/push elsewhere, you can delete this job
+  Build-and-Push:
     needs: Continuous-Integration
-    runs-on: self-hosted   # your EC2 runner is online
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -39,33 +40,77 @@ jobs:
       - id: login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build image ref (debug + guard)
-        run: |
-          set -euo pipefail
-          IMAGE="${{ steps.login.outputs.registry }}/${{ secrets.ECR_REPO }}:latest"
-          echo "registry = ${{ steps.login.outputs.registry }}"
-          echo "ECR_REPO = '${{ secrets.ECR_REPO }}'"
-          echo "IMAGE    = '$IMAGE'"
-          [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*:[a-z0-9._-]+$ ]] || { echo "Bad image ref: $IMAGE"; exit 1; }
-          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+      - name: Build & push image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
+            ${{ steps.login.outputs.registry }}/${{ secrets.ECR_REPO }}:${{ github.sha }}
 
-      - name: Ensure Docker is running
+  Deploy-via-SSM:
+    needs: Build-and-Push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - id: login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install AWS CLI (v2)
         run: |
+          curl -sSLo awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+          unzip -q awscliv2.zip
+          sudo ./aws/install
+
+      - name: Deploy on EC2 via SSM
+        env:
+          REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          REGISTRY: ${{ steps.login.outputs.registry }}
+          IMAGE: ${{ steps.login.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          # Compose the remote script
+          cat > /tmp/deploy.sh <<'SCRIPT'
+          set -euo pipefail
           sudo systemctl enable --now docker
-          docker version
 
-      - name: Free port & old container
-        run: |
+          # ECR login
+          aws ecr get-login-password --region "$REGION" \
+            | sudo docker login --username AWS --password-stdin "$REGISTRY"
+
+          # Free port/container; prune to avoid disk bloat
           sudo fuser -k 8080/tcp || true
-          docker ps -q --filter "name=virtualdoc" | xargs -r docker stop
-          docker ps -aq --filter "name=virtualdoc" | xargs -r docker rm
+          sudo docker ps -q --filter "name=virtualdoc" | xargs -r sudo docker stop
+          sudo docker ps -aq --filter "name=virtualdoc" | xargs -r sudo docker rm
+          sudo docker system prune -af || true
+          sudo rm -rf /var/lib/docker/tmp/* /var/lib/containerd/tmp/* || true
 
-      - name: Pull & run
-        run: |
-          set -euo pipefail
-          docker pull "$IMAGE"
-          docker run -d --name virtualdoc --restart unless-stopped \
-            -e PINECONE_API_KEY='${{ secrets.PINECONE_API_KEY }}' \
-            -e GROQ_API_KEY='${{ secrets.GROQ_API_KEY }}' \
+          # Pull & run fresh container
+          sudo docker pull "$IMAGE"
+          sudo docker run -d --name virtualdoc --restart unless-stopped \
+            -e PINECONE_API_KEY="$PINECONE_API_KEY" \
+            -e GROQ_API_KEY="$GROQ_API_KEY" \
             -p 8080:8080 "$IMAGE"
+
+          # Basic health check
           curl -sfI http://localhost:8080
+          SCRIPT
+
+          # Send to SSM (quote/escape safely)
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy virtualdoc" \
+            --parameters commands=["$(sed 's/"/\\"/g' /tmp/deploy.sh)"] \
+            --query "Command.CommandId" --output text)
+
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+          aws ssm list-command-invocations --command-id "$CMD_ID" --details --output table
