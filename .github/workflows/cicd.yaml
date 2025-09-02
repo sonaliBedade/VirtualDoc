@@ -1,46 +1,71 @@
-Continuous-Deployment:
-  needs: Continuous-Integration
-  runs-on: self-hosted   # your runner is online
+name: CI & Deploy
 
-  steps:
-    - uses: actions/checkout@v4
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
 
-    - uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+jobs:
+  Continuous-Integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install -U pip wheel setuptools
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Guard bad Pinecone packages
+        run: |
+          if [ -f requirements.txt ]; then
+            ! grep -qi '^pinecone-client' requirements.txt || (echo "Remove pinecone-client"; exit 1)
+            ! grep -qi '^pinecone-plugin-' requirements.txt || (echo "Remove pinecone plugins"; exit 1)
+          fi
 
-    - id: login
-      uses: aws-actions/amazon-ecr-login@v2
+  Continuous-Deployment:
+    needs: Continuous-Integration
+    runs-on: self-hosted   # your EC2 runner is online
+    steps:
+      - uses: actions/checkout@v4
 
-    - name: Build image ref (debug + guard)
-      run: |
-        set -euo pipefail
-        IMAGE="${{ steps.login.outputs.registry }}/${{ secrets.ECR_REPO }}:latest"
-        echo "registry = ${{ steps.login.outputs.registry }}"
-        echo "ECR_REPO = '${{ secrets.ECR_REPO }}'"
-        echo "IMAGE    = '$IMAGE'"
-        [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*:[a-z0-9._-]+$ ]] || { echo "Bad image ref: $IMAGE"; exit 1; }
-        echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
-    - name: Ensure Docker up
-      run: |
-        sudo systemctl enable --now docker
-        docker version
+      - id: login
+        uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Free port & old container
-      run: |
-        sudo fuser -k 8080/tcp || true
-        docker ps -q --filter "name=virtualdoc" | xargs -r docker stop
-        docker ps -aq --filter "name=virtualdoc" | xargs -r docker rm
+      - name: Build image ref (debug + guard)
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.login.outputs.registry }}/${{ secrets.ECR_REPO }}:latest"
+          echo "registry = ${{ steps.login.outputs.registry }}"
+          echo "ECR_REPO = '${{ secrets.ECR_REPO }}'"
+          echo "IMAGE    = '$IMAGE'"
+          [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*:[a-z0-9._-]+$ ]] || { echo "Bad image ref: $IMAGE"; exit 1; }
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-    - name: Pull & run
-      run: |
-        set -euo pipefail
-        docker pull "$IMAGE"
-        docker run -d --name virtualdoc --restart unless-stopped \
-          -e PINECONE_API_KEY='${{ secrets.PINECONE_API_KEY }}' \
-          -e GROQ_API_KEY='${{ secrets.GROQ_API_KEY }}' \
-          -p 8080:8080 "$IMAGE"
-        curl -sfI http://localhost:8080
+      - name: Ensure Docker is running
+        run: |
+          sudo systemctl enable --now docker
+          docker version
+
+      - name: Free port & old container
+        run: |
+          sudo fuser -k 8080/tcp || true
+          docker ps -q --filter "name=virtualdoc" | xargs -r docker stop
+          docker ps -aq --filter "name=virtualdoc" | xargs -r docker rm
+
+      - name: Pull & run
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          docker run -d --name virtualdoc --restart unless-stopped \
+            -e PINECONE_API_KEY='${{ secrets.PINECONE_API_KEY }}' \
+            -e GROQ_API_KEY='${{ secrets.GROQ_API_KEY }}' \
+            -p 8080:8080 "$IMAGE"
+          curl -sfI http://localhost:8080
