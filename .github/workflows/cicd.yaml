@@ -1,4 +1,4 @@
-name: CI & Deploy (GH-hosted + SSM)
+name: CI & Deploy (GitHub-hosted + SSM)
 
 on:
   push:
@@ -10,13 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install deps
         run: |
           python -m pip install -U pip wheel setuptools
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
       - name: Guard bad Pinecone packages
         run: |
           if [ -f requirements.txt ]; then
@@ -24,7 +27,6 @@ jobs:
             ! grep -qi '^pinecone-plugin-' requirements.txt || (echo "Remove pinecone plugins"; exit 1)
           fi
 
-  # If you already build/push elsewhere, you can delete this job
   Build-and-Push:
     needs: Continuous-Integration
     runs-on: ubuntu-latest
@@ -62,13 +64,7 @@ jobs:
       - id: login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Install AWS CLI (v2)
-        run: |
-          curl -sSLo awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-          unzip -q awscliv2.zip
-          sudo ./aws/install
-
-      - name: Deploy on EC2 via SSM
+      - name: Deploy on EC2 via SSM (no SSH)
         env:
           REGION: ${{ secrets.AWS_DEFAULT_REGION }}
           REGISTRY: ${{ steps.login.outputs.registry }}
@@ -77,40 +73,102 @@ jobs:
           PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          # Compose the remote script
-          cat > /tmp/deploy.sh <<'SCRIPT'
           set -euo pipefail
+
+          # Create the remote deploy script with all variables baked in.
+          cat > /tmp/deploy.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --- baked-in vars (injected below before base64) ---
+          REGION="_REGION_"
+          REGISTRY="_REGISTRY_"
+          IMAGE="_IMAGE_"
+          PINECONE_API_KEY="_PINECONE_API_KEY_"
+          GROQ_API_KEY="_GROQ_API_KEY_"
+
+          # Ensure basic tooling on EC2
+          if ! command -v curl >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y curl ca-certificates; fi
+          fi
+          if ! command -v unzip >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y unzip; fi
+          fi
+
+          # Ensure AWS CLI (needed on EC2 for ECR login)
+          if ! command -v aws >/dev/null 2>&1; then
+            tmpdir="$(mktemp -d)"; cd "$tmpdir"
+            curl -sSLo awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            cd /; rm -rf "$tmpdir"
+          fi
+
+          # Ensure Docker is installed and running
+          if ! command -v docker >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io
+            fi
+          fi
           sudo systemctl enable --now docker
 
-          # ECR login
-          aws ecr get-login-password --region "$REGION" \
-            | sudo docker login --username AWS --password-stdin "$REGISTRY"
+          # Login to ECR on the instance
+          aws ecr get-login-password --region "$REGION" | sudo docker login --username AWS --password-stdin "$REGISTRY"
 
-          # Free port/container; prune to avoid disk bloat
+          # Free port, stop/remove old container and prune junk
           sudo fuser -k 8080/tcp || true
           sudo docker ps -q --filter "name=virtualdoc" | xargs -r sudo docker stop
           sudo docker ps -aq --filter "name=virtualdoc" | xargs -r sudo docker rm
-          sudo docker system prune -af || true
+          sudo docker system prune -af --volumes || true
           sudo rm -rf /var/lib/docker/tmp/* /var/lib/containerd/tmp/* || true
 
-          # Pull & run fresh container
+          # Pull fresh image and run
           sudo docker pull "$IMAGE"
           sudo docker run -d --name virtualdoc --restart unless-stopped \
             -e PINECONE_API_KEY="$PINECONE_API_KEY" \
             -e GROQ_API_KEY="$GROQ_API_KEY" \
             -p 8080:8080 "$IMAGE"
 
-          # Basic health check
-          curl -sfI http://localhost:8080
-          SCRIPT
+          # Health check with retries
+          for i in {1..20}; do
+            if curl -sfI http://localhost:8080 >/dev/null 2>&1; then
+              echo "App is healthy"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Health check failed"; exit 1
+          EOS
 
-          # Send to SSM (quote/escape safely)
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Deploy virtualdoc" \
-            --parameters commands=["$(sed 's/"/\\"/g' /tmp/deploy.sh)"] \
-            --query "Command.CommandId" --output text)
+          # Bake in values safely
+          sed -i "s|_REGION_|${REGION}|g" /tmp/deploy.sh
+          sed -i "s|_REGISTRY_|${REGISTRY}|g" /tmp/deploy.sh
+          sed -i "s|_IMAGE_|${IMAGE}|g" /tmp/deploy.sh
+          sed -i "s|_PINECONE_API_KEY_|${PINECONE_API_KEY}|g" /tmp/deploy.sh
+          sed -i "s|_GROQ_API_KEY_|${GROQ_API_KEY}|g" /tmp/deploy.sh
 
-          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+          # Encode script to avoid quoting issues when sending to SSM
+          if base64 --help 2>&1 | grep -q -- '-w'; then
+            B64="$(base64 -w 0 /tmp/deploy.sh)"
+          else
+            B64="$(base64 /tmp/deploy.sh | tr -d '\n')"
+          fi
+
+          # Build a clean JSON payload for SSM to avoid shell escaping pain
+          cat > /tmp/ssm.json <<JSON
+          {
+            "DocumentName": "AWS-RunShellScript",
+            "InstanceIds": ["${INSTANCE_ID}"],
+            "Comment": "Deploy virtualdoc",
+            "Parameters": {
+              "commands": [
+                "bash -lc 'echo ${B64} | base64 -d > /tmp/deploy.sh && sudo chmod +x /tmp/deploy.sh && sudo -E /tmp/deploy.sh'"
+              ]
+            }
+          }
+          JSON
+
+          # Kick off and wait
+          CMD_ID="$(aws ssm send-command --cli-input-json file:///tmp/ssm.json --query 'Command.CommandId' --output text)"
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${INSTANCE_ID}"
           aws ssm list-command-invocations --command-id "$CMD_ID" --details --output table
